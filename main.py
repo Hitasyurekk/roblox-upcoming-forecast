@@ -14,6 +14,7 @@ OUT = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
 MAXR = 100          # ranks tracked; deeper ranks and absent games share one bucket (0)
 NAMES = 30          # named games per place at most
 MIN_P = 0.004       # do not name a game below this
+PRIOR = float(os.environ.get("FORECAST_PRIOR", "800"))  # prior strength in read pairs (backtest best 600-1500)
 
 
 def ts(s):
@@ -48,6 +49,7 @@ def transitions(reads, places, horizon_h=72):
             b = min(int(h // 6), horizon_h // 6 - 1)
             buckets.setdefault(b, []).append([rank.get(g, 0) for g in cj[:places]])
     M = [[0.0] * (MAXR + 1) for _ in range(places)]
+    npairs = sum(len(p) for p in buckets.values())
     if not buckets:
         return M, 0
     # every 6-hour horizon bucket weighs the same, so the mix matches a uniform 72-hour window
@@ -56,11 +58,13 @@ def transitions(reads, places, horizon_h=72):
         for row in pairs:
             for k, r in enumerate(row):
                 M[k][r] += w
-    return M, len(buckets)
+    return M, npairs
 
 
-def smooth(M, places):
-    """Blend each place's row with a rank kernel prior so unseen (k, r) cells keep some mass."""
+def smooth(M, places, npairs=0, strength=PRIOR):
+    """Blend each place's row with a rank kernel prior so unseen (k, r) cells keep some mass.
+    The rows are normalised over horizons, so the data's weight comes from how many read
+    pairs stand behind them: few pairs lean on the prior, many on the history."""
     out = []
     for k in range(places):
         row = M[k]
@@ -71,7 +75,7 @@ def smooth(M, places):
         prior[0] = 0.35 * sum(prior[1:])
         ps = sum(prior)
         prior = [x / ps for x in prior]
-        a = 3.0 / (3.0 + 40 * seen)          # little data: lean on the prior
+        a = strength / (strength + npairs)  # little data: lean on the prior
         tot = seen or 1.0
         out.append([(1 - a) * (row[r] / tot) + a * prior[r] for r in range(MAXR + 1)])
     return out
@@ -81,8 +85,8 @@ def main():
     task, reads = load()
     places = task.get("places", 10)
     last = reads[-1][1]
-    M, nb = transitions(reads, places)
-    P = smooth(M, places)
+    M, npairs = transitions(reads, places)
+    P = smooth(M, places, npairs)
     probs = []
     for k in range(places):
         cand = sorted(((P[k][r], r) for r in range(1, min(MAXR, len(last)) + 1)), reverse=True)
