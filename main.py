@@ -15,6 +15,10 @@ MAXR = 100          # ranks tracked; deeper ranks and absent games share one buc
 NAMES = 30          # named games per place at most
 MIN_P = 0.004       # do not name a game below this
 PRIOR = float(os.environ.get("FORECAST_PRIOR", "800"))  # prior strength in read pairs (backtest best 600-1500)
+MOM = float(os.environ.get("FORECAST_MOM", "0.3"))      # momentum: share of the recent rank change carried on
+LAG = float(os.environ.get("FORECAST_LAG", "6"))        # hours back for the momentum read (backtest: 6 beat 12)
+NEW = float(os.environ.get("FORECAST_NEW", "0.35"))     # prior share for games not on the chart now
+WIDTH = float(os.environ.get("FORECAST_WIDTH", "0.3"))  # prior spread across neighbouring ranks (backtest best 0.2-0.4)
 
 
 def ts(s):
@@ -71,8 +75,8 @@ def smooth(M, places, npairs=0, strength=PRIOR):
         seen = sum(row)
         prior = [0.0] * (MAXR + 1)
         for r in range(1, MAXR + 1):
-            prior[r] = 1.0 / (1 + abs(r - (k + 1)) * 0.6) ** 2
-        prior[0] = 0.35 * sum(prior[1:])
+            prior[r] = 1.0 / (1 + abs(r - (k + 1)) * WIDTH) ** 2
+        prior[0] = NEW * sum(prior[1:])
         ps = sum(prior)
         prior = [x / ps for x in prior]
         a = strength / (strength + npairs)  # little data: lean on the prior
@@ -81,15 +85,47 @@ def smooth(M, places, npairs=0, strength=PRIOR):
     return out
 
 
+def effective_ranks(reads, n):
+    """Momentum: a game that climbed over the last LAG hours is read as ranked a little
+    higher than it is now (and a falling one lower): rank - MOM * (rank then - rank now)."""
+    t_last, last = reads[-1]
+    prev = None
+    for t, c in reversed(reads[:-1]):
+        if t_last - t >= LAG * 3600:
+            prev = c
+            break
+    out = []
+    for r, g in enumerate(last[:n], 1):
+        if prev is None or MOM == 0:
+            out.append(float(r)); continue
+        rp = prev.index(g) + 1 if g in prev[:MAXR] else MAXR + 1
+        out.append(min(float(MAXR), max(1.0, r - MOM * (rp - r))))
+    return out
+
+
+def at(row, x):
+    """row[] read at a fractional rank x (linear between the two ranks around it)."""
+    lo = int(x)
+    hi = min(lo + 1, MAXR)
+    f = x - lo
+    return row[lo] * (1 - f) + row[hi] * f
+
+
 def main():
     task, reads = load()
     places = task.get("places", 10)
     last = reads[-1][1]
     M, npairs = transitions(reads, places)
     P = smooth(M, places, npairs)
+    eff = effective_ranks(reads, len(last))
     probs = []
     for k in range(places):
-        cand = sorted(((P[k][r], r) for r in range(1, min(MAXR, len(last)) + 1)), reverse=True)
+        # each game's weight at place k, read at its momentum-shifted rank; the place's
+        # total named mass stays what the plain ranks would give it
+        base = sum(P[k][r] for r in range(1, min(MAXR, len(last)) + 1))
+        w = [at(P[k], eff[r - 1]) for r in range(1, min(MAXR, len(last)) + 1)]
+        sw = sum(w) or 1.0
+        cand = sorted(((w[r - 1] * base / sw, r) for r in range(1, len(w) + 1)), reverse=True)
         named = [(p, r) for p, r in cand[:NAMES] if p >= MIN_P]
         s = sum(p for p, _ in named)
         if s > 0.97:  # always leave a little for games not named here
